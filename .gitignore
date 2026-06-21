@@ -4,6 +4,7 @@ DESIGN_QWEN_TRACK4.md
 # --- Secrets / credentials ---
 .env
 .env.*
+!.env.example
 *.key
 **/secrets.*
 service-account*.json

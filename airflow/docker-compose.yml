@@ -1,0 +1,20 @@
+# Lightweight local Airflow for PipelineMedic development/demo.
+# Single all-in-one container (airflow standalone: SQLite + SequentialExecutor),
+# REST API with basic auth (admin/admin). Not for production — demo only.
+services:
+  airflow:
+    image: apache/airflow:2.10.4
+    container_name: pm-airflow
+    command: >
+      bash -c "airflow db migrate &&
+      (airflow users create -u admin -p admin -r Admin -e admin@example.com -f admin -l user || true) &&
+      (airflow scheduler & exec airflow webserver)"
+    environment:
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session"
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./dags:/opt/airflow/dags

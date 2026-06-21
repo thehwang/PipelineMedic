@@ -132,19 +132,60 @@ def _looks_prod(text: str, airflow_uri: Optional[str]) -> bool:
 # Airflow REST client (Composer 2)
 # --------------------------------------------------------------------------- #
 class AirflowClient:
-    def __init__(self, airflow_uri: str):
+    """Airflow 2.x REST client with pluggable auth.
+
+    auth="adc"   -> Google Application Default Credentials (Cloud Composer 2).
+    auth="basic" -> HTTP basic auth (local/self-hosted Airflow, demo env).
+    """
+
+    def __init__(
+        self,
+        airflow_uri: str,
+        *,
+        auth: str = "adc",
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+    ):
         self.base = airflow_uri.rstrip("/")
+        self.auth = auth
+        self.username = username
+        self.password = password
         self._session = None
+
+    @classmethod
+    def from_env(cls) -> "AirflowClient":
+        """Build a client from PM_AIRFLOW_* env vars (defaults to local demo).
+
+        PM_AIRFLOW_BASE_URL  default http://localhost:8080
+        PM_AIRFLOW_AUTH      default basic   (basic|adc)
+        PM_AIRFLOW_USERNAME  default admin
+        PM_AIRFLOW_PASSWORD  default admin
+        """
+        import os
+
+        return cls(
+            os.environ.get("PM_AIRFLOW_BASE_URL", "http://localhost:8080"),
+            auth=os.environ.get("PM_AIRFLOW_AUTH", "basic"),
+            username=os.environ.get("PM_AIRFLOW_USERNAME", "admin"),
+            password=os.environ.get("PM_AIRFLOW_PASSWORD", "admin"),
+        )
 
     def _authed_session(self):
         if self._session is None:
-            import google.auth
-            from google.auth.transport.requests import AuthorizedSession
+            if self.auth == "basic":
+                import requests
 
-            creds, _ = google.auth.default(
-                scopes=["https://www.googleapis.com/auth/cloud-platform"]
-            )
-            self._session = AuthorizedSession(creds)
+                s = requests.Session()
+                s.auth = (self.username or "", self.password or "")
+                self._session = s
+            else:
+                import google.auth
+                from google.auth.transport.requests import AuthorizedSession
+
+                creds, _ = google.auth.default(
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"]
+                )
+                self._session = AuthorizedSession(creds)
         return self._session
 
     def _request(self, method: str, path: str, **kwargs):

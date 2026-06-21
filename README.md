@@ -1,8 +1,89 @@
-# ETL Ops AI — Composer 2 failure triage & auto-remediation
+# PipelineMedic — autonomous SRE agent for Airflow
 
-AI-assisted runbook for Airflow (Cloud Composer 2) failures posted to a Slack
-ops channel. The flow: **read the failure → diagnose root cause → propose a fix →
-on human approval, clear & rerun the task automatically.**
+An LLM agent that triages and auto-remediates Apache Airflow failures:
+**perceive a failed task → read its log → diagnose the root cause → if the
+failure is transient, clear & rerun it; if not, escalate to a human.**
+
+The agent reasons with **Qwen** (local Ollama in dev, Qwen Cloud / DashScope for
+the final run — same code, just env vars), but the **safety gate and diagnosis
+are deterministic Python**, so it never auto-fixes a code/SQL/schema bug no
+matter what the model says.
+
+```
+recent failures ──► [perceive] ──► [Qwen reason] ──► tool calls
+                                          │
+                          ┌───────────────┴───────────────┐
+                   transient?                         not transient?
+                  clear + rerun (gated)            refuse → escalate (PR/ticket)
+                          │
+                     [verify state]
+```
+
+## Quickstart (local demo — no cloud, no prod access)
+
+```bash
+# 0) Python deps (one-time)
+python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
+
+# 1) Verify the LLM provider (defaults to local Ollama qwen2.5:3b)
+./.venv/bin/python scripts/check_llm.py
+
+# 2) Bring up the local Airflow + 3 demo DAGs, then trigger them (see airflow/README.md)
+cd airflow && docker compose up -d && cd ..
+#   …unpause + trigger failing_timeout / failing_report_sensor / failing_bad_sql
+
+# 3) Drive the tools directly (no LLM) — proves perceive→diagnose→gate→act→verify
+./.venv/bin/python scripts/check_tools.py
+
+# 4) Run the full Qwen-driven agent on the live failures
+./.venv/bin/python scripts/run_agent.py --all
+
+# 5) …or open the dashboard: failure board + diagnosis + one-click approve/rerun,
+#    with a background scan every 10 min (PM_SCAN_INTERVAL to change)
+./.venv/bin/python scripts/serve.py        # http://localhost:8000
+```
+
+Switch to Qwen Cloud for the final run by setting `PM_LLM_*` (see `.env.example`);
+no code changes.
+
+## Repo layout
+
+| Path | What |
+|------|------|
+| `agent/config.py` | provider-agnostic LLM settings (env-driven) |
+| `agent/llm.py` | thin OpenAI-compatible client (Ollama / Qwen Cloud) |
+| `agent/tools.py` | function-calling tools + the safety gate |
+| `agent/loop.py` | the agent loop (perceive → reason → act → verify) |
+| `agent/scanner.py` | periodic scan + diagnose + incident store (optional auto-fix) |
+| `agent/web.py` | dashboard + API + background 10-min scan loop |
+| `airflow/` | local Airflow (docker compose) + 3 failing demo DAGs |
+| `scripts/` | `check_llm`, `check_tools`, `run_agent`, `serve` |
+| `airflow_ops.py` | Airflow REST client + regex diagnosis (used by tools) |
+| `data_probe.py` | optional data-level evidence (DuckDB + Iceberg) |
+
+## Dashboard & periodic scan
+
+`scripts/serve.py` runs a small FastAPI app at <http://localhost:8000>:
+
+- A background loop scans Airflow every `PM_SCAN_INTERVAL` seconds (default 600 =
+  **10 min**), diagnoses each failure, and keeps a live incident board.
+- Each incident shows category, root-cause summary, and the log evidence.
+  - **transient / auto-fixable** → one-click **Approve & Rerun** (clears the task,
+    reruns it, and verifies recovery), or
+  - **not auto-fixable** → **Escalate to human** (the gate refuses any rerun).
+- **Run agent (LLM)** runs the full Qwen reasoning loop on that incident.
+- **auto-fix toggle** (or `PM_AUTO_FIX=1`): remediate transient failures
+  automatically on each scan; risky ones still wait for human approval (HITL).
+
+This replaces the production Slack approval card with an in-app approval flow, so
+the whole demo runs with no external services.
+
+---
+
+## Production path (Cloud Composer 2 + Slack)
+
+The same `airflow_ops.py` powers a Slack-driven runbook in production:
+**read the failure → diagnose → propose a fix → on human approval, clear & rerun.**
 
 ```
 Slack failure msg ──trigger──► [Automation 1: Diagnose]
@@ -91,26 +172,26 @@ gcloud auth application-default login
 Install deps:
 
 ```bash
-pip install google-auth requests duckdb
+pip install -r requirements.txt   # openai, python-dotenv, duckdb, google-auth, requests
 ```
 
 ## Usage
 
 ```bash
 # 1) Parse a failure message (no network/auth needed)
-python airflow_ops.py parse --file sample_failure.txt
+python airflow_ops.py parse --text "$FAILURE_MSG"
 
 # 2) Diagnose (pulls logs via REST; needs ADC)
-python airflow_ops.py diagnose --file sample_failure.txt
+python airflow_ops.py diagnose --text "$FAILURE_MSG"
 
 # 3) Preview the fix — DRY-RUN, changes nothing
-python airflow_ops.py rerun --file sample_failure.txt
+python airflow_ops.py rerun --text "$FAILURE_MSG"
 
 # 4) Actually clear & rerun (prod requires --yes-prod), wait up to 10 min
-python airflow_ops.py rerun --file sample_failure.txt --execute --yes-prod --wait-seconds 600
+python airflow_ops.py rerun --text "$FAILURE_MSG" --execute --yes-prod --wait-seconds 600
 ```
 
-Pipe from stdin instead of `--file` by passing the message on `--text` or via a pipe.
+Pass the failure message via `--text`, `--file <path>`, or pipe it on stdin.
 
 ## Safety model
 

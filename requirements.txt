@@ -1,0 +1,12 @@
+# Core agent
+openai>=1.40
+python-dotenv>=1.0
+
+# Web UI + API (dashboard, periodic scan loop)
+fastapi>=0.110
+uvicorn>=0.29
+
+# data_probe.py — data-level evidence (optional at runtime)
+duckdb>=0.10
+google-auth>=2.0
+requests>=2.31
