@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-"""ETL ops helper for Cloud Composer 2 (Airflow 2.x) failure triage & remediation.
+"""Airflow (2.x) failure triage & remediation helper.
 
-Designed to be driven by a Cursor Automation agent that receives an Airflow
-failure message from a Slack ops channel. The agent calls these subcommands to:
+Talks to any Airflow via its stable REST API. The agent (or a human) calls these
+subcommands to:
 
-  1. parse     -- turn the raw Slack failure text into structured identifiers
+  1. parse     -- turn a raw failure message into structured identifiers
   2. logs      -- pull the task-instance logs via the Airflow REST API
   3. diagnose  -- classify the failure (transient vs. needs-human) from the logs
   4. rerun     -- clear the failed task so the scheduler reruns it (DRY-RUN by default)
 
-Auth model (Composer 2):
-  Composer 2's Airflow web server accepts a standard Google OAuth access token.
-  We use Application Default Credentials (ADC) + an AuthorizedSession. The agent
-  / runner just needs a service account (or user) with `roles/composer.user` on
-  the environment. No IAP client-id dance is required (that was Composer 1).
+Auth:
+  HTTP basic auth by default (works with self-hosted / managed Airflow). A
+  bearer token can be supplied instead via PM_AIRFLOW_TOKEN for setups behind a
+  token-auth proxy. Config comes from PM_AIRFLOW_* env vars (see from_env).
 
 Safety:
   - `rerun` defaults to DRY-RUN. Nothing is changed without --execute.
@@ -21,9 +20,8 @@ Safety:
   - `diagnose` only marks a failure auto-fixable when it is in the transient
     allowlist. Code/SQL/schema/data-quality errors are never auto-fixable.
 
-The Airflow REST base URL is taken directly from the Log Url in the failure
-message (it already contains the Composer web host), so no extra environment
-lookup is needed in the common path. You can override with --airflow-uri.
+The Airflow REST base URL can be read from a failure message's Log Url, or set
+explicitly with --airflow-uri / PM_AIRFLOW_BASE_URL.
 """
 
 from __future__ import annotations
@@ -62,7 +60,7 @@ _LOGURL_RE = re.compile(r"Log Url:\s*(?P<v>\S+)", re.IGNORECASE)
 
 
 def parse_failure(text: str) -> Failure:
-    """Parse the standard Composer failure-callback Slack message."""
+    """Parse a standard Airflow failure-callback message into identifiers."""
     dag = _first(_DAG_RE, text)
     task = _first(_TASK_RE, text)
     exec_time = _first(_EXEC_RE, text)
@@ -129,27 +127,29 @@ def _looks_prod(text: str, airflow_uri: Optional[str]) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Airflow REST client (Composer 2)
+# Airflow REST client
 # --------------------------------------------------------------------------- #
 class AirflowClient:
-    """Airflow 2.x REST client with pluggable auth.
+    """Airflow 2.x REST client.
 
-    auth="adc"   -> Google Application Default Credentials (Cloud Composer 2).
-    auth="basic" -> HTTP basic auth (local/self-hosted Airflow, demo env).
+    auth="basic"  -> HTTP basic auth (self-hosted / managed Airflow, demo env).
+    auth="token"  -> Bearer token (for an Airflow behind a token-auth proxy).
     """
 
     def __init__(
         self,
         airflow_uri: str,
         *,
-        auth: str = "adc",
+        auth: str = "basic",
         username: Optional[str] = None,
         password: Optional[str] = None,
+        token: Optional[str] = None,
     ):
         self.base = airflow_uri.rstrip("/")
         self.auth = auth
         self.username = username
         self.password = password
+        self.token = token
         self._session = None
 
     @classmethod
@@ -157,9 +157,10 @@ class AirflowClient:
         """Build a client from PM_AIRFLOW_* env vars (defaults to local demo).
 
         PM_AIRFLOW_BASE_URL  default http://localhost:8080
-        PM_AIRFLOW_AUTH      default basic   (basic|adc)
+        PM_AIRFLOW_AUTH      default basic   (basic|token)
         PM_AIRFLOW_USERNAME  default admin
         PM_AIRFLOW_PASSWORD  default admin
+        PM_AIRFLOW_TOKEN     bearer token (when PM_AIRFLOW_AUTH=token)
         """
         import os
 
@@ -168,24 +169,19 @@ class AirflowClient:
             auth=os.environ.get("PM_AIRFLOW_AUTH", "basic"),
             username=os.environ.get("PM_AIRFLOW_USERNAME", "admin"),
             password=os.environ.get("PM_AIRFLOW_PASSWORD", "admin"),
+            token=os.environ.get("PM_AIRFLOW_TOKEN"),
         )
 
     def _authed_session(self):
         if self._session is None:
-            if self.auth == "basic":
-                import requests
+            import requests
 
-                s = requests.Session()
-                s.auth = (self.username or "", self.password or "")
-                self._session = s
+            s = requests.Session()
+            if self.auth == "token":
+                s.headers["Authorization"] = f"Bearer {self.token or ''}"
             else:
-                import google.auth
-                from google.auth.transport.requests import AuthorizedSession
-
-                creds, _ = google.auth.default(
-                    scopes=["https://www.googleapis.com/auth/cloud-platform"]
-                )
-                self._session = AuthorizedSession(creds)
+                s.auth = (self.username or "", self.password or "")
+            self._session = s
         return self._session
 
     def _request(self, method: str, path: str, **kwargs):
@@ -266,26 +262,6 @@ def _enc(value: str) -> str:
     return quote(value, safe="")
 
 
-def discover_airflow_uri(project: str, location: str, environment: str) -> str:
-    """Resolve the Composer 2 Airflow web base via gcloud (no Slack msg needed)."""
-    import subprocess
-
-    out = subprocess.run(
-        [
-            "gcloud", "composer", "environments", "describe", environment,
-            "--project", project, "--location", location,
-            "--format", "value(config.airflowUri)",
-        ],
-        capture_output=True, text=True, check=True,
-    )
-    uri = out.stdout.strip()
-    if not uri:
-        raise RuntimeError(
-            f"Empty airflowUri for {environment} ({project}/{location})."
-        )
-    return uri.rstrip("/")
-
-
 # --------------------------------------------------------------------------- #
 # Diagnosis
 # --------------------------------------------------------------------------- #
@@ -310,7 +286,7 @@ _SIGNATURES = [
      r"\b(403|401|permission denied|forbidden|access denied|invalid credentials)\b"),
     ("not_found", False, r"\b(404)\b|not found|no such (table|file|object|dataset)"),
     ("sql_error", False,
-     r"(SQL compilation|syntax error|invalid query|BigQuery error|google\.api_core\.exceptions\.BadRequest)"),
+     r"(SQL compilation|syntax error|invalid query|ProgrammingError|BadRequest)"),
     ("schema_mismatch", False,
      r"(schema (mismatch|mismatched|does not match)|column .* not found|cannot be null|incompatible type)"),
     ("data_quality", False,
@@ -512,16 +488,14 @@ def _save_seen(path: Optional[str], seen: set) -> None:
 
 
 def cmd_scan(args) -> int:
-    if args.airflow_uri:
-        uri = args.airflow_uri.rstrip("/")
-    elif args.project and args.location and args.environment:
-        uri = discover_airflow_uri(args.project, args.location, args.environment)
-    else:
-        raise SystemExit(
-            "Provide --airflow-uri, or all of --project/--location/--environment."
-        )
+    import os
 
-    client = AirflowClient(uri)
+    uri = (args.airflow_uri or os.environ.get("PM_AIRFLOW_BASE_URL", "")).rstrip("/")
+    if not uri:
+        raise SystemExit("Provide --airflow-uri or set PM_AIRFLOW_BASE_URL.")
+
+    client = AirflowClient.from_env()
+    client.base = uri
     dag_ids = args.dag_ids.split(",") if args.dag_ids else None
     failures = client.list_failed_task_instances(args.since_minutes, dag_ids)
 
@@ -580,11 +554,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--try-number", type=int, default=1)
     sp.set_defaults(func=cmd_diagnose)
 
-    sp = sub.add_parser("scan", help="Poll Composer for recent failed tasks (Slack-independent).")
-    sp.add_argument("--airflow-uri", help="Airflow web base URL.")
-    sp.add_argument("--project", help="GCP project (with --location/--environment).")
-    sp.add_argument("--location", help="Composer region, e.g. us-east4.")
-    sp.add_argument("--environment", help="Composer environment name.")
+    sp = sub.add_parser("scan", help="Poll Airflow for recent failed tasks.")
+    sp.add_argument("--airflow-uri", help="Airflow web base URL (or PM_AIRFLOW_BASE_URL).")
     sp.add_argument("--since-minutes", type=int, default=15,
                     help="Look back window for failures (default 15).")
     sp.add_argument("--dag-ids", help="Comma-separated DAG ids to limit the scan.")

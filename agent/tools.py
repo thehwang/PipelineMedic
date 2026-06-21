@@ -19,6 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import airflow_ops  # noqa: E402
 
+from . import probe  # noqa: E402
+
 # How much log tail to hand back to the model / diagnosis.
 _LOG_TAIL_CHARS = 4000
 
@@ -118,6 +120,15 @@ def get_run_status(dag_id: str, run_id: str, task_id: str) -> dict[str, Any]:
     return {"state": ti.get("state"), "try_number": ti.get("try_number")}
 
 
+def probe_data(
+    dag_id: str,
+    table: str | None = None,
+    freshness_col: str | None = None,
+) -> dict[str, Any]:
+    """Data-level evidence: probe the table behind the DAG (rows/freshness/schema)."""
+    return probe.probe_dag(dag_id, table, freshness_col)
+
+
 # --------------------------------------------------------------------------- #
 # Registry + OpenAI tool schemas
 # --------------------------------------------------------------------------- #
@@ -127,6 +138,7 @@ TOOL_REGISTRY: dict[str, Callable[..., dict]] = {
     "run_baseline_diagnosis": run_baseline_diagnosis,
     "rerun_task": rerun_task,
     "get_run_status": get_run_status,
+    "probe_data": probe_data,
 }
 
 
@@ -219,6 +231,27 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "task_id": {"type": "string"},
                 },
                 "required": ["dag_id", "run_id", "task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "probe_data",
+            "description": (
+                "Inspect the data table behind the DAG for data-level evidence: "
+                "row count, column count, and partition freshness. Use it to tell "
+                "'report genuinely not ready / stale partition' from 'data is fine, "
+                "the problem is code'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "dag_id": {"type": "string"},
+                    "table": {"type": "string", "description": "optional override"},
+                    "freshness_col": {"type": "string", "description": "optional override"},
+                },
+                "required": ["dag_id"],
             },
         },
     },

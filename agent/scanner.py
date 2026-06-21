@@ -119,6 +119,10 @@ def scan_once() -> dict[str, Any]:
             d = tools.run_baseline_diagnosis(
                 f["dag_id"], f["run_id"], f["task_id"], f.get("try_number", 1)
             )
+            try:
+                pd = tools.probe_data(f["dag_id"])
+            except Exception:  # noqa: BLE001 - data probe is best-effort
+                pd = {}
             incident = existing or {
                 "key": key,
                 "history": [],
@@ -136,6 +140,8 @@ def scan_once() -> dict[str, Any]:
                     "summary": d["summary"],
                     "recommended_action": d["recommended_action"],
                     "evidence": d["evidence"],
+                    "data_verdict": pd.get("verdict"),
+                    "data_reachable": pd.get("reachable"),
                     "last_seen": _now_iso(),
                 }
             )

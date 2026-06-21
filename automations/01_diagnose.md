@@ -1,19 +1,19 @@
-# Automation 1 — Diagnose Composer failure
+# Automation 1 — Diagnose Airflow failure
 
-**Trigger:** New message in the Slack ops channel (the Composer failure-callback channel).
+**Trigger:** New message in the ops alert channel (the Airflow failure-callback channel).
 
-**Tools:** Read Slack, Post to Slack, Use MCP server (Slack), Terminal (to run `airflow_ops.py`).
+**Tools:** Read channel, Post to channel, Terminal (to run `airflow_ops.py`).
 
 **Gate (do nothing unless matched):** The message contains both `Job Failed` and a
-`Log Url:` pointing at `*.composer.googleusercontent.com`.
+`Log Url:` pointing at the Airflow web host.
 
 **Prompt:**
 
 ```
-You triage Airflow (Cloud Composer 2) failures posted to this Slack channel.
+You triage Airflow failures posted to this ops channel.
 
-A new message arrived. If it is NOT a Composer failure callback (must contain
-"Job Failed" and a "Log Url:" composer.googleusercontent.com link), stop silently.
+A new message arrived. If it is NOT an Airflow failure callback (must contain
+"Job Failed" and a "Log Url:" Airflow web link), stop silently.
 
 Otherwise:
 1. Save the full message text to a temp file and run:

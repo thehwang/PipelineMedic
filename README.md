@@ -38,9 +38,15 @@ cd airflow && docker compose up -d && cd ..
 # 4) Run the full Qwen-driven agent on the live failures
 ./.venv/bin/python scripts/run_agent.py --all
 
-# 5) …or open the dashboard: failure board + diagnosis + one-click approve/rerun,
-#    with a background scan every 10 min (PM_SCAN_INTERVAL to change)
+# 5) Seed the local demo warehouse (so the data-level probe has real data)
+./.venv/bin/python scripts/seed_warehouse.py
+
+# 6) …or open the dashboard: failure board + diagnosis + data evidence +
+#    one-click approve/rerun, with a background scan every 10 min
 ./.venv/bin/python scripts/serve.py        # http://localhost:8000
+
+# 7) Score the diagnosis layer (accuracy + the SAFETY gate metric)
+./.venv/bin/python scripts/eval.py
 ```
 
 Switch to Qwen Cloud for the final run by setting `PM_LLM_*` (see `.env.example`);
@@ -55,11 +61,12 @@ no code changes.
 | `agent/tools.py` | function-calling tools + the safety gate |
 | `agent/loop.py` | the agent loop (perceive → reason → act → verify) |
 | `agent/scanner.py` | periodic scan + diagnose + incident store (optional auto-fix) |
+| `agent/probe.py` | data-level evidence (local DuckDB warehouse) |
 | `agent/web.py` | dashboard + API + background 10-min scan loop |
 | `airflow/` | local Airflow (docker compose) + 3 failing demo DAGs |
-| `scripts/` | `check_llm`, `check_tools`, `run_agent`, `serve` |
+| `eval/cases.jsonl` | labeled failure-log set for the diagnosis eval |
+| `scripts/` | `check_llm`, `check_tools`, `run_agent`, `serve`, `seed_warehouse`, `eval` |
 | `airflow_ops.py` | Airflow REST client + regex diagnosis (used by tools) |
-| `data_probe.py` | optional data-level evidence (DuckDB + Iceberg) |
 
 ## Dashboard & periodic scan
 
@@ -78,101 +85,108 @@ no code changes.
 This replaces the production Slack approval card with an in-app approval flow, so
 the whole demo runs with no external services.
 
+## Data-level evidence
+
+Log patterns alone can't tell "report genuinely not ready" from "upstream wrote
+zero rows" or "schema drifted". `probe_data` inspects the table behind the DAG
+(row count, freshness, schema) and attaches a verdict to each incident:
+
+| DAG | data verdict | corroborates |
+|-----|--------------|--------------|
+| `failing_report_sensor` | latest partition is 1 day stale | report genuinely not ready (transient) |
+| `failing_timeout` | data fresh & healthy | infra blip, not a data problem (safe rerun) |
+| `failing_bad_sql` | data fresh & healthy | the bug is in the query code (needs human) |
+
+The probe reads a warehouse over SQL — here a local DuckDB warehouse seeded by
+`scripts/seed_warehouse.py`. In a real deployment you point the same interface at
+your own warehouse; the evidence shape is unchanged.
+
+## Evaluation & safety
+
+`scripts/eval.py` scores the diagnosis layer against `eval/cases.jsonl` (labeled
+synthetic + anonymized failure logs):
+
+- **category accuracy** — did we name the right root cause?
+- **auto-fixable accuracy** — transient vs needs-human
+- **UNSAFE count** — non-transient failures wrongly marked auto-fixable; this is
+  the gate's core guarantee and **must be 0** (the script exits non-zero otherwise)
+
+Current run: 95% category, 100% auto-fixable, **0 unsafe**. The lone category miss
+still lands on the needs-human side — so even an imperfect label stays safe.
+
 ---
 
-## Production path (Cloud Composer 2 + Slack)
+## Production path (any Airflow + an alert channel)
 
-The same `airflow_ops.py` powers a Slack-driven runbook in production:
+The same `airflow_ops.py` powers a runbook in production:
 **read the failure → diagnose → propose a fix → on human approval, clear & rerun.**
 
 ```
-Slack failure msg ──trigger──► [Automation 1: Diagnose]
+failure alert ──trigger──► [Automation 1: Diagnose]
    parse dag/task/run/web_base → pull logs (REST) → classify root cause
-   → reply in thread: cause + recommended action + "reply `approve` to auto-fix"
+   → reply: cause + recommended action + "reply `approve` to auto-fix"
                               │
                        human replies `approve`
                               ▼
                 ──trigger──► [Automation 2: Remediate]
-   re-derive identifiers from thread → airflow_ops rerun --execute
+   re-derive identifiers → airflow_ops rerun --execute
    → poll task state → reply with the result
 ```
 
-Two automations (not one) because each Cursor Automation trigger is stateless;
-making approval a *separate* trigger is what guarantees "act only after consent".
+Approval is a *separate* trigger, which guarantees "act only after consent".
 
-### Alternative input: poll Composer directly (no Slack dependency)
+### Alternative input: poll Airflow directly (no alert dependency)
 
-Instead of (or alongside) the Slack-triggered diagnose, a cron automation can
-pull failures straight from the Airflow REST API:
+Instead of (or alongside) an alert-triggered diagnose, a cron job can pull
+failures straight from the Airflow REST API:
 
 ```
 cron (every 10m) ──► airflow_ops.py scan --diagnose --state-file ...
-   → for each NEW failed task: post alert to Slack (+ Jira if not auto-fixable)
-   → auto-fix stays gated behind the `approve` reply (Automation 2)
+   → for each NEW failed task: surface it (+ ticket if not auto-fixable)
+   → auto-fix stays gated behind the `approve` step (Automation 2)
 ```
 
-This makes Slack an *output* channel only, so monitoring works even when the
-Slack failure-callback message is missing or delayed. See `automations/03_scan_cron.md`.
+This makes the alert channel an *output* only, so monitoring works even when the
+failure-callback message is missing or delayed. See `automations/03_scan_cron.md`.
 
 ## Components
 
 - `airflow_ops.py` — the enabling CLI the agent calls. Subcommands:
-  - `parse` — Slack failure text → structured JSON (`dag_id`, `task_id`, `run_id`, `airflow_uri`, `is_prod`)
+  - `parse` — failure text → structured JSON (`dag_id`, `task_id`, `run_id`, `airflow_uri`, `is_prod`)
   - `logs` — fetch task-instance logs via the Airflow REST API
   - `diagnose` — fetch logs + classify (transient vs. needs-human)
-  - `scan` — poll Composer for recent failed tasks (Slack-independent input)
+  - `scan` — poll Airflow for recent failed tasks
   - `rerun` — clear the failed task so the scheduler reruns it (**DRY-RUN by default**)
-- `data_probe.py` — **data-level** evidence via DuckDB + `iceberg_scan` on `gs://`
-  (borrowed from the `pq` tool). Checks the table behind a failed DAG: reachable?
-  row count? freshness (max of a date column)? schema readable? Turns
-  "report not ready" vs "upstream wrote 0 rows" vs "schema drift" from a guess
-  into evidence.
-
-### Borrowing from `pq` (jq for Parquet)
-
-`pq` already reads `gs://` parquet via DuckDB httpfs with GCS auth from
-`PQ_GCS_BEARER_TOKEN` / `PQ_GCS_HMAC_*`. `data_probe.py` reuses that exact env
-contract but targets **Iceberg** tables with
-`iceberg_scan('gs://…/<schema>/<table>', allow_moved_paths => true)`.
-
-```bash
-export PQ_GCS_BEARER_TOKEN=$(gcloud auth print-access-token)
-python data_probe.py --bucket my-data-lake-iceberg \
-    --schema analytics --table events_daily_stg \
-    --freshness-col event_date
-```
-
-For plain parquet (not Iceberg), just shell out to `pq` directly — e.g.
-`pq diff a.parquet b.parquet` as a schema-drift CI gate (non-zero on drift),
-or `pq stats` / `pq count` for quick profiling.
-
-The diagnose automation can attach a `data_probe` result to its Slack summary so
-reviewers see the *data* state alongside the log signature before approving a rerun.
+- `agent/probe.py` — **data-level** evidence via DuckDB against the demo
+  warehouse (`scripts/seed_warehouse.py`). Checks the table behind a failed DAG:
+  reachable? row count? freshness (max of a date column)? Turns "report not
+  ready" vs "upstream wrote 0 rows" from a guess into evidence. To point it at a
+  real warehouse, extend `_probe_warehouse` with your own connection.
 
 ## Why this works with minimal config
 
-The Composer failure-callback message already includes a **Log Url** that contains
-the Composer 2 web host (`https://<id>-dot-<region>.composer.googleusercontent.com`).
-`airflow_ops.py` uses that host directly as the Airflow REST base, so no extra
-environment lookup is needed in the common path.
+A failure-callback message includes a **Log Url** with the Airflow web host;
+`airflow_ops.py` uses that host directly as the REST base, so no extra
+environment lookup is needed in the common path. Otherwise set
+`PM_AIRFLOW_BASE_URL` (defaults to the local demo at `http://localhost:8080`).
 
-## Auth & IAM (Composer 2)
+## Auth
 
-Composer 2's Airflow web server accepts a standard Google OAuth access token — no
-IAP client-id token dance (that was Composer 1). The runner just needs ADC for a
-principal with access to the environment:
+HTTP basic auth by default (the local demo uses `admin/admin`). Config is
+env-driven:
 
 ```bash
-# Service account used by the Cursor cloud agent (recommended for prod):
-#   roles/composer.user            on the Composer environment's project
-# Local testing with your own creds:
-gcloud auth application-default login
+PM_AIRFLOW_BASE_URL=http://localhost:8080
+PM_AIRFLOW_AUTH=basic          # or: token
+PM_AIRFLOW_USERNAME=admin
+PM_AIRFLOW_PASSWORD=admin
+# PM_AIRFLOW_TOKEN=...          # when PM_AIRFLOW_AUTH=token (behind a proxy)
 ```
 
 Install deps:
 
 ```bash
-pip install -r requirements.txt   # openai, python-dotenv, duckdb, google-auth, requests
+pip install -r requirements.txt   # openai, python-dotenv, requests, duckdb, fastapi, uvicorn
 ```
 
 ## Usage
@@ -181,7 +195,7 @@ pip install -r requirements.txt   # openai, python-dotenv, duckdb, google-auth, 
 # 1) Parse a failure message (no network/auth needed)
 python airflow_ops.py parse --text "$FAILURE_MSG"
 
-# 2) Diagnose (pulls logs via REST; needs ADC)
+# 2) Diagnose (pulls logs via the Airflow REST API)
 python airflow_ops.py diagnose --text "$FAILURE_MSG"
 
 # 3) Preview the fix — DRY-RUN, changes nothing
@@ -215,7 +229,7 @@ Pass the failure message via `--text`, `--file <path>`, or pipe it on stdin.
 
 ## To finalize (outside this repo)
 
-1. Authenticate the Slack integration and pick the ops channel.
-2. Make sure the Cursor cloud agent has ADC for a `roles/composer.user` principal.
+1. Point `PM_AIRFLOW_*` at your Airflow (or keep the local demo defaults).
+2. Pick an alert/output channel for the diagnose + remediate automations.
 3. Create the two automations in the **Agents Window** (Automations editor) using
    the prompts in `automations/`.

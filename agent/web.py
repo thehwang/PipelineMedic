@@ -161,6 +161,7 @@ INDEX_HTML = r"""<!doctype html>
   .b-rerun_failed{background:#3a2a15;color:var(--orange)}
   .b-escalated{background:#26303d;color:var(--gray)}
   .desc{color:var(--muted);margin:8px 0 4px}
+  .data{color:#9fb4cc;font-size:12.5px;margin:2px 0 4px}
   .ids{color:#6f7d92;font-size:12px;font-family:ui-monospace,Menlo,monospace}
   details{margin-top:10px}
   summary{cursor:pointer;color:var(--muted);font-size:12px}
@@ -254,6 +255,7 @@ function render(){
         ${i.auto_fixable?'<span class="badge b-recovered">auto-fixable</span>':'<span class="badge b-needs_human">needs human</span>'}
       </div>
       <div class="desc">${esc(i.summary)}</div>
+      ${i.data_verdict?`<div class="data">🗄 data: ${esc(i.data_verdict)}</div>`:''}
       <div class="ids">run ${esc(i.run_id)}</div>
       <details><summary>evidence</summary><pre>${esc(i.evidence)}</pre></details>
       <div class="actions">${actions}</div>
