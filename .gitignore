@@ -1,0 +1,32 @@
+# --- Local-only design doc (keep out of the public repo) ---
+DESIGN_QWEN_TRACK4.md
+
+# --- Secrets / credentials ---
+.env
+.env.*
+*.key
+**/secrets.*
+service-account*.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- State / scratch ---
+*.seen.json
+state.json
+*.duckdb
+*.log
+
+# --- OS / editor ---
+.DS_Store
+.idea/
+*.swp
